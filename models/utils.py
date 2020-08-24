@@ -5,9 +5,8 @@
 #   UNFINISHED RESEARCH CODE
 #   DO NOT DISTRIBUTE
 #
-#   For ICML 2020 Submission
-#   Author: XXXXXXXXXXXXXXXXXXX
-#   Date:   XXXXXXXXXXXXXXXXXXX
+#   Author: Shiyu Li
+#   Date:   12/02/2019
 #
 #   Changelog:
 #   2020-01-22 Merge the decomposing utilities.
@@ -19,12 +18,17 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 import torchvision
 import torchvision.datasets as datasets
+from torchvision.datasets.mnist import MNIST
+import torch.distributed as dist
 
 from decompose.decomConv import DecomposedConv2D
+from models.op_count import profile
 from models.resnet_s import LambdaLayer
 from tensorboardX import SummaryWriter
 
 import numpy as np
+import tqdm
+import datetime
 import time
 import os
 import copy
@@ -57,9 +61,116 @@ def train_cifar10(model, epochs=100, batch_size=128, lr=0.01, reg=5e-4,
     elif scheduler == 'cosine':
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    _train(model, trainloader, testloader, optimizer, epochs,
-           scheduler, checkpoint_path, finetune=finetune,
-           cross=cross, cross_interval=cross_interval, spar_method=spar_reg, spar_reg=spar_param)
+    start_epoch, best_acc = _load_checkpoint(model, optimizer, checkpoint_path, scheduler)
+    best_acc_path = ''
+
+    if checkpoint_path=='':
+        checkpoint_path = os.path.join(os.path.curdir, 'ckpt/'+ model.__class__.__name__
+                                       + time.strftime('%m%d%H%M', time.localtime()))
+    if not os.path.exists(checkpoint_path):
+        os.mkdir(checkpoint_path)
+
+    criterion = nn.CrossEntropyLoss()
+
+    global_steps = 0
+    start = time.time()
+    for epoch in range(start_epoch, epochs):
+        print('\nEpoch: %d' % epoch)
+        model.train()
+        train_loss = 0
+        correct = 0
+        total = 0
+
+        #Swap training basis or coefficient
+
+        if cross and (epoch+1)%cross_interval==0:      #Interleave training bases and coefficient
+            print('Swaping Bases and Coefficient Training...')
+            for _, m in model.named_modules():
+                if isinstance(m, DecomposedConv2D):
+                    m.coefs.requires_grad = not m.coefs.requires_grad
+                    m.basis.requires_grad = not m.basis.requires_grad
+
+        for batch_idx, (inputs, targets) in enumerate(trainloader):
+            inputs, targets = inputs.to('cuda'), targets.to('cuda')
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+
+            loss = loss.view(1)
+            if spar_reg is not None:
+                reg_loss = torch.zeros_like(loss).to('cuda')
+                #Sparsity Regularization
+                if spar_reg == 'l1':
+                    for n, m in model.named_parameters():
+                        if "coef" in n:
+                            reg_loss += torch.sum(torch.abs(m))
+
+                loss += reg_loss * spar_param
+
+            loss.backward()
+
+            if finetune:
+                for n, m in model.named_parameters():
+                    if 'coef' in n:
+                        m.grad[m==0] = 0
+
+            optimizer.step()
+            train_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+            global_steps += 1
+
+            if global_steps % 16 == 0:
+                end = time.time()
+                num_examples_per_second = 16 * batch_size / (end - start)
+                print("[Step=%d]\tLoss=%.4f\tacc=%.4f\t%.1f examples/second"
+                      % (global_steps, train_loss / (batch_idx + 1), (correct / total), num_examples_per_second))
+                start = time.time()
+
+        if scheduler is not None:
+            scheduler.step()
+
+        model.eval()
+        test_loss = 0
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for batch_idx, (inputs, targets) in enumerate(testloader):
+                inputs, targets = inputs.to("cuda"), targets.to("cuda")
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+
+                test_loss += loss.item()
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+        num_val_steps = len(testloader)
+        val_acc = correct / total
+
+        print("Test Loss=%.4f, Test acc=%.4f" % (test_loss / (num_val_steps), val_acc))
+
+        if spar_reg is not None:
+            sparse = 0
+            total = 0
+            for n, m in model.named_parameters():
+                if 'coef' in n:
+                    sparse += np.prod(list(m[m<=1e-7].shape))
+                    total += np.prod(list(m.shape))
+            print("Sparsity Level %.6f"%(sparse/total))
+
+        if val_acc > best_acc:
+            best_acc = val_acc
+            print("Saving Weight...")
+            if os.path.exists(best_acc_path):
+                os.remove(best_acc_path)
+            best_acc_path = os.path.join(checkpoint_path, "retrain_weight_%d_%.2f.pt"%(epoch, best_acc))
+            torch.save(model.state_dict(), best_acc_path)
+
+        if (epoch+1) % 10 == 0:
+            _save_checkpoint(model, optimizer, epoch, best_acc, checkpoint_path, scheduler)
+
+    return best_acc
 
 def eval_cifar10(model, batch_size=128):
     print('==> Preparing data..')
@@ -114,12 +225,16 @@ def train_imagenet(model, epochs=100, batch_size=128, lr=0.01, reg=5e-4,
     transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
+            #transforms.ToTensor(),
+            #normalize,
         ]))
 
     train_dataset = datasets.ImageFolder(traindir,
         transforms.Compose([
             transforms.RandomResizedCrop(224),
             transforms.RandomHorizontalFlip(),
+            #transforms.ToTensor(),
+            #normalize,
         ]))
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
@@ -150,12 +265,16 @@ def train_imagenet(model, epochs=100, batch_size=128, lr=0.01, reg=5e-4,
            sampler=train_sampler)
 
 def val_imagenet(model, valdir="../../ILSVRC/Data/CLS-LOC/val/"):
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
     print("Loading Validation Data...")
 
     val_dataset = datasets.ImageFolder(valdir,
         transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
+            #transforms.ToTensor(),
+            #normalize,
         ]))
 
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
@@ -231,29 +350,30 @@ def _train(model, trainloader, testloader,  optimizer, epochs, scheduler=None,
             outputs = model(inputs)
             loss = criterion(outputs, targets)
 
+            loss = loss.view(1)
+
             acc1, acc5 = accuracy(outputs, targets, topk=(1, 5))
-            losses.update(loss.item(), inputs.size(0))
             top1.update(acc1[0], inputs.size(0))
             top5.update(acc5[0], inputs.size(0))
 
             #Sparsity Regularization
+            reg_loss = torch.zeros_like(loss).to('cuda')
             if spar_method == 'l1':
-                reg_loss = torch.zeros_like(loss).to('cuda')
                 for n, m in model.named_parameters():
                     if "coef" in n:
                         reg_loss += torch.sum(torch.abs(m))
                 for n, m in model.named_modules():
                     if isinstance(m, nn.Conv2d) and m.weight.shape[2] == 1:     #Prune 1x1 convolution
                         reg_loss += torch.sum(torch.abs(m.weight))
-
-                loss += reg_loss * spar_reg
             elif spar_method == 'naive_l1':
                 reg_loss = torch.zeros_like(loss).to('cuda')
                 for n, m in model.named_modules():
                     if isinstance(m, nn.Conv2d):
                         reg_loss += torch.sum(torch.abs(m.weight))
 
-                loss += reg_loss * spar_reg
+            loss += reg_loss * spar_reg
+
+            losses.update(loss.item(), inputs.size(0))
 
             loss.backward()
 
@@ -377,6 +497,10 @@ class data_prefetcher():
         self.stream = torch.cuda.Stream()
         self.mean = torch.tensor([0.485 * 255, 0.456 * 255, 0.406 * 255]).cuda().view(1,3,1,1)
         self.std = torch.tensor([0.229 * 255, 0.224 * 255, 0.225 * 255]).cuda().view(1,3,1,1)
+        # With Amp, it isn't necessary to manually convert data to half.
+        # if args.fp16:
+        #     self.mean = self.mean.half()
+        #     self.std = self.std.half()
         self.preload()
 
     def preload(self):
@@ -386,10 +510,27 @@ class data_prefetcher():
             self.next_input = None
             self.next_target = None
             return
-
+        # if record_stream() doesn't work, another option is to make sure device inputs are created
+        # on the main stream.
+        # self.next_input_gpu = torch.empty_like(self.next_input, device='cuda')
+        # self.next_target_gpu = torch.empty_like(self.next_target, device='cuda')
+        # Need to make sure the memory allocated for next_* is not still in use by the main stream
+        # at the time we start copying to next_*:
+        # self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             self.next_input = self.next_input.cuda(non_blocking=True)
             self.next_target = self.next_target.cuda(non_blocking=True)
+            # more code for the alternative if record_stream() doesn't work:
+            # copy_ will record the use of the pinned source tensor in this side stream.
+            # self.next_input_gpu.copy_(self.next_input, non_blocking=True)
+            # self.next_target_gpu.copy_(self.next_target, non_blocking=True)
+            # self.next_input = self.next_input_gpu
+            # self.next_target = self.next_target_gpu
+
+            # With Amp, it isn't necessary to manually convert data to half.
+            # if args.fp16:
+            #     self.next_input = self.next_input.half()
+            # else:
             self.next_input = self.next_input.float()
             self.next_input = self.next_input.sub_(self.mean).div_(self.std)
 
@@ -486,6 +627,14 @@ class ProgressMeter(object):
         fmt = '{:' + str(num_digits) + 'd}'
         return '[' + fmt + '/' + fmt.format(num_batches) + ']'
 
+
+def adjust_learning_rate(optimizer, epoch, args):
+    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
+    lr = args.lr * (0.1 ** (epoch // 30))
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
+
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
     with torch.no_grad():
@@ -502,6 +651,34 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def compute_non_zero(model, tol=1e-3):
+    layers = []
+    params = model.state_dict()
+    for key, item in params.items():
+        if "coefs" in key:
+            param = item.cpu().numpy()
+            x = np.sum((param >= tol), axis=1)
+            num_nz, count = np.unique(x, return_counts=True)
+            res = {}
+            for i in range(len(count)):
+                res[num_nz[i]] = count[i]
+            print(res)
+            layers.append(res)
+    return layers
+
+def operate_params(model, obj, func):
+    '''
+    :param model: The model to be operate
+    :param obj: The correspond parameters to operate
+    :param func: The operate function, receive parameter tensor as the input
+    :return: The modified model
+    '''
+    ret_list = []
+    for n, m in model.named_parameters():
+        if obj in n:
+            m.data, ret = func(m)
+            ret_list.append(ret)
+    return ret_list
 
 def compute_sparsity(model):
     n_zero = 0
@@ -513,7 +690,7 @@ def compute_sparsity(model):
             n_coefs += np.prod(list(m.shape))
 
     for n, m in model.named_modules():
-        if isinstance(m, torch.nn.Conv2d):
+        if isinstance(m, torch.nn.Conv2d) or isinstance(m, torch.nn.Linear):
             n_param += np.prod(list(m.weight.shape))
             n_zero += np.prod(list(m.weight[m.weight==0].shape))
     n_param += n_coefs
@@ -567,7 +744,7 @@ def show_basis_angle(params, visualize = False):
 
     return layer_sim
 
-#For Sequential Models like VGG16 and AlexNet, and ResNet56
+#For Sequential Models like VGG16 and AlexNet
 def shrink(model, iterative=True, Linear_req = True):
     model.eval()            #Avoid Problem for BN, just for quick test and need revise
     in_remain = []
@@ -593,7 +770,7 @@ def shrink(model, iterative=True, Linear_req = True):
         if 'shortcut' in n:
             shortcut_path.append(len(in_redun)-1)     #Indicate the end point indices of the current shorcut path
             if isinstance(m, LambdaLayer):
-                shortcut_padding.append(m)
+                shortcut_padding.append(len(in_redun)-1)
 
     #Get the intersection of the input and output channels
     for i in range(1, len(in_remain)):
@@ -711,6 +888,8 @@ def shrink(model, iterative=True, Linear_req = True):
 
             ori_basis = m.basis.detach().cpu().numpy()
             ori_coefs = m.coefs.detach().cpu().numpy().reshape((m.out_channels, m.in_channels, m.num_basis))
+            
+            #ori_bias = m.bias.detach().cpu().numpy()
             m.in_channels = len(in_remain[i])
             m.out_channels = m.out_channels if skip else len(out_remain[i])
             m.num_basis = len(basis_remain[i])
@@ -723,6 +902,8 @@ def shrink(model, iterative=True, Linear_req = True):
 
             new_basis = np.zeros((m.num_basis, m.kernel_size[0]*m.kernel_size[1]), dtype=np.float32)
             new_coefs = np.zeros((m.out_channels, m.in_channels, m.num_basis),  dtype=np.float32)
+            #new_bias = ori_bias[r_out_channels_idx]
+            
 
             for bidx in range(m.num_basis):
                 new_basis[bidx, :] = ori_basis[r_basis_idx[bidx], :]
@@ -735,6 +916,7 @@ def shrink(model, iterative=True, Linear_req = True):
 
             m.coefs = nn.Parameter(torch.tensor(new_coefs.reshape(m.out_channels*m.in_channels, m.num_basis)), requires_grad=True)
             m.basis = nn.Parameter(torch.tensor(new_basis), requires_grad=False)
+            #m.bias = nn.Parameter(torch.tensor(new_bias), requires_grad=True)
             i += 1
 
         if isinstance(m, torch.nn.BatchNorm2d):

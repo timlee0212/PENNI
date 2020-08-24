@@ -60,14 +60,12 @@ class DecomposedConv2D(nn.Module):
 		# 1          1 1 1 1
 		# 2   ---->  2 2 2 2
 		# 3          3 3 3 3
-		basis_kernel = self.basis.repeat((1, self.in_channels)).view((self.num_basis*self.in_channels, 1, self.kernel_size[0], self.kernel_size[1]))
+		basis_kernel = self.basis.view((self.num_basis, 1, self.kernel_size[0], self.kernel_size[1])).repeat((self.in_channels, 1, 1, 1 ))
 		w = ((x.shape[2] + self.padding[0]) - self.kernel_size[0]//2) //self.stride[0]
-		h = ((x.shape[3] + self.padding[1]) - self.kernel_size[1] // 2) // self.stride[1]
-		mid_fm = F.conv2d(x.repeat((1,self.num_basis, 1, 1)), basis_kernel, self.bias, self.stride, self.padding, self.dilation, num_groups=self.in_channels)
-		out = torch.zeros((x.shape[0], self.out_channels, w*h))
-		for batch_idx in range(x.shape[0]):
-			out[batch_idx, :, :] = torch.mm(self.coefs.view(self.out_channels, self.in_channels*self.num_basis), \
-						   mid_fm[batch_idx, :, :, :].view(self.in_channels*self.num_basis, -1))
-		out = out.view(x.shape[0], self.out_channels, w, h)
+		mid_fm = F.conv2d(x.repeat((1,self.num_basis, 1, 1)), basis_kernel, self.bias, self.stride, self.padding, self.dilation, groups = self.num_basis * self.in_channels)
+		out = F.conv2d(mid_fm, self.coefs.view(self.out_channels, self.in_channels * self.num_basis, 1, 1), stride=1, padding=0, dilation=1)
+		#Even Slower
+		#out = self.coefs.mm(conv2d_depthwise(x.repeat((1,self.num_basis, 1, 1)), basis_kernel, self.bias, self.stride, self.padding, self.dilation)\
+		#	.view((-1, w * w))).view((1, self.out_channels, w, w))
 	
 		return out
