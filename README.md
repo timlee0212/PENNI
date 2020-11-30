@@ -1,5 +1,5 @@
 # PENNI
-This repo provides the code of [PENNI: Pruned Kernel Sharing for Efficient CNN Inference](https://arxiv.org/abs/2005.07133).
+This repo provides the code of [PENNI: Pruned Kernel Sharing for Efficient CNN Inference](https://proceedings.icml.cc/paper/2020/hash/46f76a4bda9a9579eab38a8f6eabcda1-Abstract.html).
 
 Install Requirement Packages:
 
